@@ -33,3 +33,29 @@ Render automatically detects the provided `Dockerfile`. Simply choose **Docker**
 - **Port**: Render injects `$PORT` (typically 10000). The node listens internally on `0.0.0.0:$PORT` in plain HTTP/WS.
 - **Edge TLS**: Render terminates SSL at its cloud edge. The server automatically detects `RENDER_EXTERNAL_HOSTNAME`, registers port `443`, and enables `tls: true` on the control plane.
 - **Keep-Alive**: When `KEEP_ALIVE=true` or when Render is detected, the server automatically self-pings its `/` health endpoint every 10 minutes to prevent Render free-tier idle spin-down.
+
+---
+
+## Bypassing Anti-VPN & Datacenter Blocks (Zero-Root Userspace WARP)
+
+When accessing sites with aggressive anti-proxy filters (Cloudflare Turnstile, Netflix, banking sites), exit nodes hosted on Hetzner, M247, or Render can get flagged because of their datacenter ASN.
+
+To solve this **without requiring root, `sudo`, or `apt`** inside preset containers (e.g. Pterodactyl):
+
+Simply add to your `.env` or container environment variables:
+```bash
+ENABLE_WARP=true
+```
+
+### What Happens Automatically:
+1. The server auto-downloads the standalone userspace `wireproxy` binary if missing.
+2. It auto-registers a clean Cloudflare WARP account via API and generates WireGuard keys.
+3. It launches the userspace SOCKS5 bridge on `127.0.0.1:40000`.
+4. All outbound web requests exit through **Cloudflare's clean consumer IP pool**.
+5. Zero `apt`, zero `sudo`, zero kernel modules required.
+
+Alternatively, connect through an external residential proxy:
+```bash
+OUTBOUND_PROXY=socks5://user:pass@host:port
+```
+

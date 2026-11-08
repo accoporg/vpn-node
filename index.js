@@ -5,6 +5,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import dns from 'node:dns';
 import { WebSocketServer } from 'ws';
+import { initWarp, dialTarget } from './warp.js';
+
+let outboundProxy = null;
 
 // Automatically load configuration from .env or config.json if present
 if (fs.existsSync('.env')) {
@@ -214,6 +217,7 @@ const requestHandler = (req, res) => {
     tls: EXTERNAL_TLS,
     localTls: HAS_LOCAL_TLS,
     platform: IS_RENDER ? 'render' : 'standalone',
+    warp: Boolean(outboundProxy?.enabled),
     host: PUBLIC_HOST,
     port: EXTERNAL_PORT,
     activeSessions: activeSessions.size,
@@ -286,53 +290,62 @@ wss.on('connection', (ws, req) => {
   ws.on('close', cleanup);
   ws.on('error', cleanup);
 
-  // Connect to target destination
-  targetSocket = net.connect({ host, port }, () => {
-    if (isCleanedUp) {
-      targetSocket.destroy();
-      return;
-    }
-
-    // 1. WS -> TCP with Backpressure
-    ws.on('message', (chunk) => {
-      const canWrite = targetSocket.write(chunk);
-      if (!canWrite && ws.pause) {
-        ws.pause();
+  // Connect to target destination (Direct or via Cloudflare WARP / Outbound SOCKS5)
+  dialTarget({ targetHost: host, targetPort: port, outboundProxy })
+    .then((sock) => {
+      if (isCleanedUp) {
+        sock.destroy();
+        return;
       }
-    });
+      targetSocket = sock;
+      session.targetSocket = targetSocket;
+      targetSocket.on('close', cleanup);
+      targetSocket.on('error', cleanup);
 
-    targetSocket.on('drain', () => {
-      if (ws.resume) ws.resume();
-    });
-
-    // 2. TCP -> WS with Backpressure
-    targetSocket.on('data', (chunk) => {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(chunk);
-        if (ws.bufferedAmount > 64 * 1024) {
-          targetSocket.pause();
+      // 1. WS -> TCP with Backpressure
+      ws.on('message', (chunk) => {
+        const canWrite = targetSocket.write(chunk);
+        if (!canWrite && ws.pause) {
+          ws.pause();
         }
-      }
+      });
+
+      targetSocket.on('drain', () => {
+        if (ws.resume) ws.resume();
+      });
+
+      // 2. TCP -> WS with Backpressure
+      targetSocket.on('data', (chunk) => {
+        if (ws.readyState === ws.OPEN) {
+          ws.send(chunk);
+          if (ws.bufferedAmount > 64 * 1024) {
+            targetSocket.pause();
+          }
+        }
+      });
+
+      // Check bufferedAmount periodically to resume TCP reads
+      drainInterval = setInterval(() => {
+        if (ws.bufferedAmount < 16 * 1024 && targetSocket.isPaused()) {
+          targetSocket.resume();
+        }
+      }, 20);
+    })
+    .catch((err) => {
+      console.warn(`[DIAL] Failed to reach ${host}:${port}: ${err.message}`);
+      cleanup();
     });
-
-    // Check bufferedAmount periodically to resume TCP reads
-    drainInterval = setInterval(() => {
-      if (ws.bufferedAmount < 16 * 1024 && targetSocket.isPaused()) {
-        targetSocket.resume();
-      }
-    }, 20);
-  });
-
-  session.targetSocket = targetSocket;
-  targetSocket.on('close', cleanup);
-  targetSocket.on('error', cleanup);
 });
 
 server.listen(PORT, HOST, async () => {
+  // Initialize Userspace WARP / Outbound Proxy if enabled
+  outboundProxy = await initWarp();
+
   console.log(`===============================================`);
   console.log(` WS-VPN Relay Node [${NODE_ALIAS}] listening on ${HOST}:${PORT}`);
   console.log(` External: ${PUBLIC_HOST || HOST}:${EXTERNAL_PORT} (TLS: ${EXTERNAL_TLS})`);
   console.log(` Platform: ${IS_RENDER ? 'Render Cloud (PaaS)' : 'Standalone VPS'}`);
+  console.log(` Outbound: ${outboundProxy?.enabled ? `Proxied via ${outboundProxy.host}:${outboundProxy.port} (Clean Consumer IP)` : 'Direct VPS Egress'}`);
   console.log(` Control Plane: ${CONTROL_PLANE}`);
   console.log(`===============================================`);
   if (NODE_SECRET) {
