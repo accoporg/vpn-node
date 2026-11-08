@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: ws-vpn-node
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ALIAS
+        value: ws-render-1
+      - key: NODE_SECRET
+        sync: false
+      - key: CONTROL_PLANE
+        value: https://cnct.accopture.top
+      - key: KEEP_ALIVE
+        value: "true"
