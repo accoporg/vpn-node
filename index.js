@@ -311,10 +311,18 @@ function handleCliClient(ws, req, clientToken, host, port) {
   let isCleanedUp = false;
   let drainInterval = null;
   let targetSocket = null;
+  const earlyChunks = [];
+
+  const onEarlyMessage = (chunk) => {
+    earlyChunks.push(chunk);
+  };
+  ws.on('message', onEarlyMessage);
 
   const cleanup = () => {
     if (isCleanedUp) return;
     isCleanedUp = true;
+    ws.off('message', onEarlyMessage);
+    earlyChunks.length = 0;
     if (drainInterval) clearInterval(drainInterval);
     activeSessions.delete(session);
     if (targetSocket && !targetSocket.destroyed) targetSocket.destroy();
@@ -336,14 +344,22 @@ function handleCliClient(ws, req, clientToken, host, port) {
       targetSocket.on('close', cleanup);
       targetSocket.on('error', cleanup);
 
+      ws.off('message', onEarlyMessage);
+
+      // Flush all buffered early chunks (e.g. TLS Client Hello)
+      for (const chunk of earlyChunks) {
+        targetSocket.write(chunk);
+      }
+      earlyChunks.length = 0;
+
       // 1. WS -> TCP with Backpressure
       ws.on('message', (chunk) => {
         const canWrite = targetSocket.write(chunk);
-        if (!canWrite && ws.pause) ws.pause();
+        if (!canWrite && ws._socket) ws._socket.pause();
       });
 
       targetSocket.on('drain', () => {
-        if (ws.resume) ws.resume();
+        if (ws._socket) ws._socket.resume();
       });
 
       // 2. TCP -> WS with Backpressure
@@ -468,6 +484,10 @@ function handleVlessClient(ws, req) {
 
       // 1. TCP Tunneling
       if (command === 1) {
+        const earlyChunks = [];
+        const onEarlyMessage = (chunk) => earlyChunks.push(chunk);
+        ws.on('message', onEarlyMessage);
+
         const sock = await dialTarget({ targetHost, targetPort, outboundProxy });
         if (isCleanedUp) {
           sock.destroy();
@@ -482,13 +502,19 @@ function handleVlessClient(ws, req) {
           targetSocket.write(initialPayload);
         }
 
+        ws.off('message', onEarlyMessage);
+        for (const chunk of earlyChunks) {
+          targetSocket.write(chunk);
+        }
+        earlyChunks.length = 0;
+
         ws.on('message', (chunk) => {
           const canWrite = targetSocket.write(chunk);
-          if (!canWrite && ws.pause) ws.pause();
+          if (!canWrite && ws._socket) ws._socket.pause();
         });
 
         targetSocket.on('drain', () => {
-          if (ws.resume) ws.resume();
+          if (ws._socket) ws._socket.resume();
         });
 
         targetSocket.on('data', (chunk) => {

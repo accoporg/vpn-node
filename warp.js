@@ -285,11 +285,31 @@ export async function initWarp(options = {}) {
 export function dialTarget({ targetHost, targetPort, outboundProxy, timeout = 12000 }) {
   if (!outboundProxy || !outboundProxy.enabled) {
     return new Promise((resolve, reject) => {
-      const socket = net.connect({ host: targetHost, port: targetPort, timeout }, () => resolve(socket));
-      socket.on('error', reject);
-      socket.on('timeout', () => {
-        socket.destroy();
-        reject(new Error(`Direct TCP dial to ${targetHost}:${targetPort} timed out`));
+      let settled = false;
+      const socket = net.connect({ host: targetHost, port: targetPort });
+
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          socket.destroy();
+          reject(new Error(`Direct TCP dial to ${targetHost}:${targetPort} timed out`));
+        }
+      }, timeout);
+
+      socket.once('connect', () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(socket);
+        }
+      });
+
+      socket.once('error', (err) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          reject(err);
+        }
       });
     });
   }
