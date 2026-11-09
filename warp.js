@@ -147,13 +147,27 @@ export async function initWarp() {
       detached: false
     });
 
+    let lastError = '';
+    warpProcess.stdout.on('data', (d) => {
+      const msg = d.toString().trim();
+      if (msg) console.log(`[WARP-LOG] ${msg}`);
+    });
+
+    warpProcess.stderr.on('data', (d) => {
+      const msg = d.toString().trim();
+      if (msg) {
+        lastError = msg;
+        console.error(`[WARP-ERR] ${msg}`);
+      }
+    });
+
     warpProcess.on('error', (err) => {
       console.error('[WARP] Daemon process error:', err.message);
     });
 
     warpProcess.on('exit', (code, signal) => {
       if (code !== 0 && code !== null) {
-        console.warn(`[WARP] Daemon exited with code ${code} / ${signal}`);
+        console.warn(`[WARP] Daemon exited with code ${code} / ${signal}. Reason: ${lastError || 'None reported'}`);
       }
     });
 
