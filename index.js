@@ -7,6 +7,11 @@ import dns from 'node:dns';
 import { WebSocketServer } from 'ws';
 import { initWarp, dialTarget } from './warp.js';
 
+// Force IPv4 DNS lookups first to prevent ENETUNREACH in Docker/Pterodactyl environments without IPv6 routing
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {}
+
 let outboundProxy = null;
 
 // Automatically load configuration from .env or config.json if present
@@ -339,7 +344,7 @@ wss.on('connection', (ws, req) => {
 
 server.listen(PORT, HOST, async () => {
   // Initialize Userspace WARP / Outbound Proxy if enabled
-  outboundProxy = await initWarp();
+  outboundProxy = await initWarp({ controlPlane: CONTROL_PLANE, nodeSecret: NODE_SECRET });
 
   console.log(`===============================================`);
   console.log(` WS-VPN Relay Node [${NODE_ALIAS}] listening on ${HOST}:${PORT}`);

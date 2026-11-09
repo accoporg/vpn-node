@@ -2,8 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import net from 'node:net';
+import dns from 'node:dns';
 import crypto from 'node:crypto';
 import { spawn, execSync } from 'node:child_process';
+
+// Force IPv4 DNS lookups first to prevent ENETUNREACH in Docker/Pterodactyl environments without IPv6 routing
+try {
+  dns.setDefaultResultOrder('ipv4first');
+} catch {}
 
 const WARP_DIR = path.resolve('.warp');
 const WARP_BIN = path.join(WARP_DIR, 'wireproxy');
@@ -54,7 +60,7 @@ async function ensureWireproxyBinary() {
 // -------------------------------------------------------------
 // 2. Auto-Register Cloudflare WARP Account
 // -------------------------------------------------------------
-async function ensureWarpConfig() {
+async function ensureWarpConfig({ controlPlane, nodeSecret } = {}) {
   if (fs.existsSync(WARP_CONF)) {
     return;
   }
@@ -64,28 +70,69 @@ async function ensureWarpConfig() {
   const pubKey = keyPair.publicKey.export({ type: 'spki', format: 'der' }).slice(-32).toString('base64');
   const privKey = keyPair.privateKey.export({ type: 'pkcs8', format: 'der' }).slice(-32).toString('base64');
 
-  const regRes = await fetch('https://api.cloudflareclient.com/v0a2158/reg', {
-    method: 'POST',
-    headers: {
-      'User-Agent': 'okhttp/3.12.1',
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      install_id: '',
-      tos: new Date().toISOString(),
-      key: pubKey,
-      fcm_token: '',
-      type: 'Android',
-      model: 'Android',
-      locale: 'en_US'
-    })
-  });
+  const regPayload = {
+    install_id: '',
+    tos: new Date().toISOString(),
+    key: pubKey,
+    fcm_token: '',
+    type: 'Android',
+    model: 'Android',
+    locale: 'en_US'
+  };
 
-  if (!regRes.ok) {
-    throw new Error(`WARP API registration failed: HTTP ${regRes.status}`);
+  let data = null;
+
+  // 1. Direct registration attempt with IPv4 preference
+  try {
+    const regRes = await fetch('https://api.cloudflareclient.com/v0a2158/reg', {
+      method: 'POST',
+      headers: {
+        'User-Agent': 'okhttp/3.12.1',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(regPayload),
+      signal: AbortSignal.timeout(10000)
+    });
+
+    if (regRes.ok) {
+      data = await regRes.json();
+    } else {
+      console.warn(`[WARP] Direct registration returned HTTP ${regRes.status}`);
+    }
+  } catch (err) {
+    const detail = err.cause ? (err.cause.code || err.cause.message) : err.message;
+    console.warn(`[WARP] Direct registration failed (${detail}).`);
   }
 
-  const data = await regRes.json();
+  // 2. Fallback via Control Plane proxy if direct registration failed
+  if (!data && controlPlane) {
+    try {
+      console.log(`[WARP] Attempting fallback via control plane (${controlPlane}/api/warp-register)...`);
+      const headers = { 'Content-Type': 'application/json' };
+      if (nodeSecret) headers['Authorization'] = `Bearer ${nodeSecret}`;
+
+      const fallbackRes = await fetch(`${controlPlane}/api/warp-register`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(regPayload),
+        signal: AbortSignal.timeout(10000)
+      });
+
+      if (fallbackRes.ok) {
+        data = await fallbackRes.json();
+        console.log('[WARP] Successfully registered WARP account via control plane proxy!');
+      } else {
+        console.warn(`[WARP] Control plane proxy registration returned HTTP ${fallbackRes.status}`);
+      }
+    } catch (fallbackErr) {
+      console.warn(`[WARP] Control plane proxy registration failed: ${fallbackErr.message}`);
+    }
+  }
+
+  if (!data) {
+    throw new Error('WARP API registration failed (direct and control plane fallback both failed)');
+  }
+
   const v4Address = data.config?.interface?.addresses?.v4 || '172.16.0.2';
   const peerKey = data.config?.peers?.[0]?.public_key || 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=';
   const endpoint = '162.159.192.1:2408';
@@ -112,7 +159,9 @@ BindAddress = 127.0.0.1:${SOCKS_PORT}
 // -------------------------------------------------------------
 // 3. Start Userspace WARP Process
 // -------------------------------------------------------------
-export async function initWarp() {
+export async function initWarp(options = {}) {
+  const controlPlane = options.controlPlane || process.env.CONTROL_PLANE;
+  const nodeSecret = options.nodeSecret || process.env.NODE_SECRET;
   // Check if custom outbound proxy is provided
   if (process.env.OUTBOUND_PROXY) {
     try {
@@ -139,7 +188,7 @@ export async function initWarp() {
 
   try {
     await ensureWireproxyBinary();
-    await ensureWarpConfig();
+    await ensureWarpConfig({ controlPlane, nodeSecret });
 
     console.log(`[WARP] Starting userspace WARP daemon on 127.0.0.1:${SOCKS_PORT}...`);
     warpProcess = spawn(WARP_BIN, ['-c', WARP_CONF], {
@@ -156,8 +205,12 @@ export async function initWarp() {
     warpProcess.stderr.on('data', (d) => {
       const msg = d.toString().trim();
       if (msg) {
-        lastError = msg;
-        console.error(`[WARP-ERR] ${msg}`);
+        if (!msg.startsWith('DEBUG:')) {
+          lastError = msg;
+          console.error(`[WARP-ERR] ${msg}`);
+        } else if (process.env.DEBUG === 'true') {
+          console.log(`[WARP-DEBUG] ${msg}`);
+        }
       }
     });
 
@@ -211,7 +264,8 @@ export async function initWarp() {
       port: SOCKS_PORT
     };
   } catch (err) {
-    console.error(`[WARP] Initialization failed: ${err.message}`);
+    const detail = err.cause ? ` (${err.cause.code || err.cause.message})` : '';
+    console.error(`[WARP] Initialization failed: ${err.message}${detail}`);
     console.warn('[WARP] Falling back to direct VPS outbound.');
     return { enabled: false };
   }
