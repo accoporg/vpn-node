@@ -1,6 +1,8 @@
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
+import dgram from 'node:dgram';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import dns from 'node:dns';
@@ -13,6 +15,28 @@ try {
 } catch {}
 
 let outboundProxy = null;
+
+// Helpers for V2Ray / VLESS protocol compatibility
+function tokenToUUID(token) {
+  if (!token) return '';
+  const clean = token.replace(/-/g, '');
+  if (/^[0-9a-fA-F]{32}$/.test(clean.slice(0, 32))) {
+    const h = clean.slice(0, 32).toLowerCase();
+    return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;
+  }
+  const h = crypto.createHash('md5').update(token).digest('hex');
+  return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;
+}
+
+function formatUUID(buf) {
+  return [
+    buf.subarray(0, 4).toString('hex'),
+    buf.subarray(4, 6).toString('hex'),
+    buf.subarray(6, 8).toString('hex'),
+    buf.subarray(8, 10).toString('hex'),
+    buf.subarray(10, 16).toString('hex')
+  ].join('-');
+}
 
 // Automatically load configuration from .env or config.json if present
 if (fs.existsSync('.env')) {
@@ -255,12 +279,10 @@ server.on('error', (err) => {
 
 const wss = new WebSocketServer({ server });
 
-wss.on('connection', (ws, req) => {
-  const reqUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const clientToken = reqUrl.searchParams.get('token') || req.headers['x-auth-token'];
-  const host = reqUrl.searchParams.get('host');
-  const port = parseInt(reqUrl.searchParams.get('port'), 10);
-
+// -------------------------------------------------------------
+// Native CLI Client Connection Handler (vpn connect <alias>)
+// -------------------------------------------------------------
+function handleCliClient(ws, req, clientToken, host, port) {
   // Validate token if sync is active
   if (NODE_SECRET && validTokens.size > 0) {
     if (!clientToken || !validTokens.has(clientToken)) {
@@ -268,11 +290,6 @@ wss.on('connection', (ws, req) => {
       ws.close(4001, 'Unauthorized');
       return;
     }
-  }
-
-  if (!host || !port) {
-    ws.close(1008, 'Missing host or port parameters');
-    return;
   }
 
   const session = { ws, targetSocket: null, token: clientToken };
@@ -291,7 +308,6 @@ wss.on('connection', (ws, req) => {
     if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) ws.close();
   };
 
-  // Immediate WS lifecycle listeners to prevent unhandled errors
   ws.on('close', cleanup);
   ws.on('error', cleanup);
 
@@ -310,9 +326,7 @@ wss.on('connection', (ws, req) => {
       // 1. WS -> TCP with Backpressure
       ws.on('message', (chunk) => {
         const canWrite = targetSocket.write(chunk);
-        if (!canWrite && ws.pause) {
-          ws.pause();
-        }
+        if (!canWrite && ws.pause) ws.pause();
       });
 
       targetSocket.on('drain', () => {
@@ -329,7 +343,6 @@ wss.on('connection', (ws, req) => {
         }
       });
 
-      // Check bufferedAmount periodically to resume TCP reads
       drainInterval = setInterval(() => {
         if (ws.bufferedAmount < 16 * 1024 && targetSocket.isPaused()) {
           targetSocket.resume();
@@ -340,6 +353,202 @@ wss.on('connection', (ws, req) => {
       console.warn(`[DIAL] Failed to reach ${host}:${port}: ${err.message}`);
       cleanup();
     });
+}
+
+// -------------------------------------------------------------
+// VLESS Mobile Protocol Handler (v2rayNG, V2Box, Streisand, Shadowrocket, Sing-box)
+// -------------------------------------------------------------
+function handleVlessClient(ws, req) {
+  let isCleanedUp = false;
+  let targetSocket = null;
+  let udpSocket = null;
+  let drainInterval = null;
+  const session = { ws, targetSocket: null, token: 'vless-client' };
+  activeSessions.add(session);
+
+  const cleanup = () => {
+    if (isCleanedUp) return;
+    isCleanedUp = true;
+    if (drainInterval) clearInterval(drainInterval);
+    activeSessions.delete(session);
+    if (targetSocket && !targetSocket.destroyed) targetSocket.destroy();
+    if (udpSocket) {
+      try { udpSocket.close(); } catch {}
+    }
+    if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) ws.close();
+  };
+
+  ws.on('close', cleanup);
+  ws.on('error', cleanup);
+
+  // Wait for initial binary VLESS request frame
+  ws.once('message', async (buffer) => {
+    try {
+      if (!Buffer.isBuffer(buffer)) buffer = Buffer.from(buffer);
+      if (buffer.length < 24) {
+        ws.close(1002, 'VLESS header too short');
+        return;
+      }
+
+      const version = buffer[0];
+      if (version !== 0) {
+        ws.close(1002, 'Unsupported VLESS version');
+        return;
+      }
+
+      const clientUuid = formatUUID(buffer.subarray(1, 17));
+
+      // Authenticate UUID against synced tokens
+      if (NODE_SECRET && validTokens.size > 0) {
+        let matched = false;
+        for (const tok of validTokens) {
+          if (tokenToUUID(tok) === clientUuid || tok === clientUuid) {
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) {
+          console.warn(`[VLESS] Rejected unauthorized UUID ${clientUuid} from ${req.socket.remoteAddress}`);
+          ws.close(4001, 'Unauthorized UUID');
+          return;
+        }
+      }
+
+      const addonsLen = buffer[17];
+      let cursor = 18 + addonsLen;
+      if (buffer.length < cursor + 4) {
+        ws.close(1002, 'Invalid VLESS command section');
+        return;
+      }
+
+      const command = buffer[cursor]; // 1 = TCP, 2 = UDP
+      const targetPort = buffer.readUInt16BE(cursor + 1);
+      const addressType = buffer[cursor + 3];
+      cursor += 4;
+
+      let targetHost = '';
+      if (addressType === 1) { // IPv4
+        if (buffer.length < cursor + 4) return ws.close(1002, 'Invalid IPv4 address');
+        targetHost = `${buffer[cursor]}.${buffer[cursor+1]}.${buffer[cursor+2]}.${buffer[cursor+3]}`;
+        cursor += 4;
+      } else if (addressType === 2) { // Domain
+        const dLen = buffer[cursor];
+        cursor += 1;
+        if (buffer.length < cursor + dLen) return ws.close(1002, 'Invalid domain name');
+        targetHost = buffer.subarray(cursor, cursor + dLen).toString('utf8');
+        cursor += dLen;
+      } else if (addressType === 3) { // IPv6
+        if (buffer.length < cursor + 16) return ws.close(1002, 'Invalid IPv6 address');
+        const parts = [];
+        for (let i = 0; i < 16; i += 2) parts.push(buffer.readUInt16BE(cursor + i).toString(16));
+        targetHost = parts.join(':');
+        cursor += 16;
+      } else {
+        ws.close(1002, 'Unknown address type');
+        return;
+      }
+
+      const initialPayload = buffer.subarray(cursor);
+
+      // Send VLESS response header (version 0, addons length 0)
+      ws.send(Buffer.from([0x00, 0x00]));
+
+      // 1. TCP Tunneling
+      if (command === 1) {
+        const sock = await dialTarget({ targetHost, targetPort, outboundProxy });
+        if (isCleanedUp) {
+          sock.destroy();
+          return;
+        }
+        targetSocket = sock;
+        session.targetSocket = targetSocket;
+        targetSocket.on('close', cleanup);
+        targetSocket.on('error', cleanup);
+
+        if (initialPayload.length > 0) {
+          targetSocket.write(initialPayload);
+        }
+
+        ws.on('message', (chunk) => {
+          const canWrite = targetSocket.write(chunk);
+          if (!canWrite && ws.pause) ws.pause();
+        });
+
+        targetSocket.on('drain', () => {
+          if (ws.resume) ws.resume();
+        });
+
+        targetSocket.on('data', (chunk) => {
+          if (ws.readyState === ws.OPEN) {
+            ws.send(chunk);
+            if (ws.bufferedAmount > 64 * 1024) targetSocket.pause();
+          }
+        });
+
+        drainInterval = setInterval(() => {
+          if (ws.bufferedAmount < 16 * 1024 && targetSocket.isPaused()) {
+            targetSocket.resume();
+          }
+        }, 20);
+
+      // 2. UDP Tunneling (DNS / VoIP / Gaming)
+      } else if (command === 2) {
+        udpSocket = dgram.createSocket('udp4');
+        udpSocket.on('error', cleanup);
+        udpSocket.on('message', (msg) => {
+          if (ws.readyState === ws.OPEN) {
+            const lenBuf = Buffer.alloc(2);
+            lenBuf.writeUInt16BE(msg.length, 0);
+            ws.send(Buffer.concat([lenBuf, msg]));
+          }
+        });
+
+        const forwardUdp = (chunk) => {
+          let off = 0;
+          while (off + 2 < chunk.length) {
+            const pLen = chunk.readUInt16BE(off);
+            off += 2;
+            if (off + pLen <= chunk.length) {
+              const pkt = chunk.subarray(off, off + pLen);
+              udpSocket.send(pkt, targetPort, targetHost);
+              off += pLen;
+            } else {
+              break;
+            }
+          }
+        };
+
+        if (initialPayload.length > 2) {
+          forwardUdp(initialPayload);
+        }
+
+        ws.on('message', forwardUdp);
+
+      } else {
+        ws.close(1003, 'Unsupported VLESS command');
+      }
+
+    } catch (err) {
+      console.warn(`[VLESS] Error handling client: ${err.message}`);
+      cleanup();
+    }
+  });
+}
+
+wss.on('connection', (ws, req) => {
+  const reqUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const clientToken = reqUrl.searchParams.get('token') || req.headers['x-auth-token'];
+  const host = reqUrl.searchParams.get('host');
+  const port = parseInt(reqUrl.searchParams.get('port'), 10);
+
+  // If host and port are given in search parameters, handle as native CLI client
+  if (host && port) {
+    handleCliClient(ws, req, clientToken, host, port);
+    return;
+  }
+
+  // Otherwise, handle as standard VLESS client (v2rayNG, V2Box, Streisand, etc.)
+  handleVlessClient(ws, req);
 });
 
 server.listen(PORT, HOST, async () => {
