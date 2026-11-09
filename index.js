@@ -178,8 +178,16 @@ async function registerNode() {
       signal: AbortSignal.timeout(10000)
     });
 
-    const regData = await regRes.json();
-    if (regRes.ok) {
+    let regData;
+    const contentType = regRes.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      regData = await regRes.json();
+    } else {
+      const text = await regRes.text();
+      regData = { error: `Server returned HTTP ${regRes.status} (non-JSON): ${text.slice(0, 80).replace(/\s+/g, ' ')}...` };
+    }
+
+    if (regRes.ok && regData && regData.domain) {
       fs.writeFileSync(REGISTER_FILE, JSON.stringify({
         ...regData,
         tls: EXTERNAL_TLS,
@@ -190,7 +198,7 @@ async function registerNode() {
       console.log(`[REG] Success! Node registered as: ${regData.domain} (${publicIp}:${EXTERNAL_PORT}, TLS: ${EXTERNAL_TLS})`);
       if (regData.dns) console.log(`[REG] Cloudflare DNS status: ${regData.dns}`);
     } else {
-      console.error(`[REG] Registration failed (${regRes.status}):`, regData);
+      console.error(`[REG] Registration failed (${regRes.status}):`, regData.error || regData);
     }
   } catch (err) {
     console.error(`[REG] Registration error: ${err.message}`);
@@ -198,7 +206,7 @@ async function registerNode() {
 }
 
 // -------------------------------------------------------------
-// 2. 60-Second Token Sync Loop
+// 2. 60-Second Token Sync Loop & Auto-Registration Retry
 // -------------------------------------------------------------
 async function syncTokens() {
   if (!NODE_SECRET) return;
@@ -230,9 +238,14 @@ async function syncTokens() {
   }
 }
 
-// Recurring 60s timer
+// Recurring timer: token sync every 60s, registration retry every 30s until successful
 if (NODE_SECRET) {
   setInterval(syncTokens, 60000);
+  setInterval(async () => {
+    if (!fs.existsSync(REGISTER_FILE)) {
+      await registerNode();
+    }
+  }, 30000);
 }
 
 // -------------------------------------------------------------
