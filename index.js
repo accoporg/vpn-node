@@ -14,7 +14,7 @@ try {
   dns.setDefaultResultOrder('ipv4first');
 } catch {}
 
-export const VERSION = '2.4.0';
+export const VERSION = '2.4.1';
 let outboundProxy = null;
 
 // Helpers for V2Ray / VLESS protocol compatibility
@@ -295,6 +295,88 @@ server.on('error', (err) => {
 });
 
 const wss = new WebSocketServer({ server });
+
+// -------------------------------------------------------------
+// Native DNS Client Handler (RFC 1035 TCP-framed DNS via DoH)
+// -------------------------------------------------------------
+function handleDnsClient(ws, req, clientToken) {
+  // Validate token if sync is active
+  if (NODE_SECRET && validTokens.size > 0) {
+    if (!clientToken || !validTokens.has(clientToken)) {
+      console.warn(`[AUTH] Rejected DNS client from ${req.socket.remoteAddress}: Invalid token.`);
+      ws.close(4001, 'Unauthorized');
+      return;
+    }
+  }
+
+  const session = { ws, targetSocket: null, token: clientToken };
+  activeSessions.add(session);
+
+  let inBuffer = Buffer.alloc(0);
+
+  const cleanup = () => {
+    activeSessions.delete(session);
+    if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) ws.close();
+  };
+
+  ws.on('close', cleanup);
+  ws.on('error', cleanup);
+
+  ws.on('message', (chunk) => {
+    inBuffer = Buffer.concat([inBuffer, chunk]);
+    while (inBuffer.length >= 2) {
+      const qLen = inBuffer.readUInt16BE(0);
+      if (inBuffer.length >= 2 + qLen) {
+        const dnsQuery = inBuffer.subarray(2, 2 + qLen);
+        inBuffer = inBuffer.subarray(2 + qLen);
+
+        (async () => {
+          try {
+            let res = null;
+            try {
+              res = await fetch('https://1.1.1.1/dns-query', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/dns-message',
+                  'Accept': 'application/dns-message'
+                },
+                body: dnsQuery,
+                signal: AbortSignal.timeout(2500)
+              });
+            } catch {}
+
+            if (!res || !res.ok) {
+              try {
+                res = await fetch('https://dns.google/dns-query', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/dns-message',
+                    'Accept': 'application/dns-message'
+                  },
+                  body: dnsQuery,
+                  signal: AbortSignal.timeout(2500)
+                });
+              } catch {}
+            }
+
+            if (res && res.ok && ws.readyState === ws.OPEN) {
+              const respBuf = Buffer.from(await res.arrayBuffer());
+              const framed = Buffer.concat([
+                Buffer.from([respBuf.length >> 8, respBuf.length & 0xFF]),
+                respBuf
+              ]);
+              ws.send(framed);
+            }
+          } catch (e) {
+            console.warn(`[DNS] DoH resolution failed: ${e.message}`);
+          }
+        })();
+      } else {
+        break;
+      }
+    }
+  });
+}
 
 // -------------------------------------------------------------
 // Native CLI Client Connection Handler (vpn connect <alias>)
@@ -592,6 +674,10 @@ wss.on('connection', (ws, req) => {
 
   // If host and port are given in search parameters, handle as native CLI client
   if (host && port) {
+    if (port === 53 || host === 'dns') {
+      handleDnsClient(ws, req, clientToken);
+      return;
+    }
     handleCliClient(ws, req, clientToken, host, port);
     return;
   }
