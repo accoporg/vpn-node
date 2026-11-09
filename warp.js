@@ -21,7 +21,14 @@ let warpProcess = null;
 // 1. Download & Extract wireproxy (No root / No apt needed)
 // -------------------------------------------------------------
 async function ensureWireproxyBinary() {
-  if (fs.existsSync(WARP_BIN)) {
+  const desiredVersion = process.env.WIREPROXY_VERSION || 'v1.0.7';
+  const versionMarker = path.join(WARP_DIR, '.version');
+  let currentVersion = '';
+  if (fs.existsSync(versionMarker)) {
+    try { currentVersion = fs.readFileSync(versionMarker, 'utf8').trim(); } catch {}
+  }
+
+  if (fs.existsSync(WARP_BIN) && currentVersion === desiredVersion) {
     try {
       fs.chmodSync(WARP_BIN, 0o755);
       return;
@@ -38,8 +45,8 @@ async function ensureWireproxyBinary() {
     tarName = 'wireproxy_linux_arm64.tar.gz';
   }
 
-  const downloadUrl = `https://github.com/octeep/wireproxy/releases/download/v1.0.8/${tarName}`;
-  console.log(`[WARP] Downloading standalone wireproxy binary (${arch}) from GitHub...`);
+  const downloadUrl = `https://github.com/octeep/wireproxy/releases/download/${desiredVersion}/${tarName}`;
+  console.log(`[WARP] Downloading standalone wireproxy binary ${desiredVersion} (${arch}) from GitHub...`);
 
   const res = await fetch(downloadUrl, { redirect: 'follow' });
   if (!res.ok) {
@@ -54,7 +61,8 @@ async function ensureWireproxyBinary() {
   execSync(`tar -xzf "${tarPath}" -C "${WARP_DIR}"`);
   try { fs.unlinkSync(tarPath); } catch {}
   fs.chmodSync(WARP_BIN, 0o755);
-  console.log(`[WARP] Standalone wireproxy binary ready!`);
+  fs.writeFileSync(versionMarker, desiredVersion);
+  console.log(`[WARP] Standalone wireproxy binary (${desiredVersion}) ready!`);
 }
 
 // -------------------------------------------------------------
