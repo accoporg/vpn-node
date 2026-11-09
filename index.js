@@ -303,6 +303,10 @@ function handleCliClient(ws, req, clientToken, host, port) {
       ws.close(4001, 'Unauthorized');
       return;
     }
+  // Reject private / poisoned IPs (e.g. 10.10.34.x Iranian censorship landers)
+  if (!host || host.startsWith('10.10.34.') || host.startsWith('127.') || host === 'localhost') {
+    ws.close(1008, 'Blocked destination');
+    return;
   }
 
   const session = { ws, targetSocket: null, token: clientToken };
