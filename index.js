@@ -14,6 +14,7 @@ try {
   dns.setDefaultResultOrder('ipv4first');
 } catch {}
 
+export const VERSION = '2.4.0';
 let outboundProxy = null;
 
 // Helpers for V2Ray / VLESS protocol compatibility
@@ -173,7 +174,8 @@ async function registerNode() {
         ip: publicIp,
         port: EXTERNAL_PORT,
         tls: EXTERNAL_TLS,
-        host: PUBLIC_HOST
+        host: PUBLIC_HOST,
+        version: VERSION
       }),
       signal: AbortSignal.timeout(10000)
     });
@@ -190,6 +192,7 @@ async function registerNode() {
     if (regRes.ok && regData && regData.domain) {
       fs.writeFileSync(REGISTER_FILE, JSON.stringify({
         ...regData,
+        version: VERSION,
         tls: EXTERNAL_TLS,
         alias: NODE_ALIAS,
         port: EXTERNAL_PORT,
@@ -255,6 +258,7 @@ const requestHandler = (req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     status: 'online',
+    version: VERSION,
     alias: NODE_ALIAS,
     tls: EXTERNAL_TLS,
     localTls: HAS_LOCAL_TLS,
@@ -601,7 +605,7 @@ server.listen(PORT, HOST, async () => {
   outboundProxy = await initWarp({ controlPlane: CONTROL_PLANE, nodeSecret: NODE_SECRET });
 
   console.log(`===============================================`);
-  console.log(` WS-VPN Relay Node [${NODE_ALIAS}] listening on ${HOST}:${PORT}`);
+  console.log(` WS-VPN Relay Node [${NODE_ALIAS}] v${VERSION} listening on ${HOST}:${PORT}`);
   console.log(` External: ${PUBLIC_HOST || HOST}:${EXTERNAL_PORT} (TLS: ${EXTERNAL_TLS})`);
   console.log(` Platform: ${IS_RENDER ? 'Render Cloud (PaaS)' : 'Standalone VPS'}`);
   console.log(` Outbound: ${outboundProxy?.enabled ? `Proxied via ${outboundProxy.host}:${outboundProxy.port} (Clean Consumer IP)` : 'Direct VPS Egress'}`);
