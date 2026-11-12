@@ -1,715 +1,687 @@
+/**
+ * Clean VLESS over WebSocket Server for Container Environments
+ * Compatible with v2rayNG, V2Box, Streisand, Sing-box, Nekoray, Shadowrocket, Clash-Meta.
+ * Designed for Docker, Pterodactyl, BungeeHost, Bot-Hosting, Render, and VPS nodes.
+ */
+
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
 import dgram from 'node:dgram';
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import dns from 'node:dns';
-import { WebSocketServer } from 'ws';
-import { initWarp, dialTarget } from './warp.js';
+import { WebSocketServer, WebSocket } from 'ws';
 
-// Force IPv4 DNS lookups first to prevent ENETUNREACH in Docker/Pterodactyl environments without IPv6 routing
-try {
-  dns.setDefaultResultOrder('ipv4first');
-} catch {}
+// -------------------------------------------------------------
+// 1. Configuration & UUIDs
+// -------------------------------------------------------------
+const DEFAULT_UUID = '4ed3658d-7f0b-5e27-f826-f75d33f18f7a';
+const RAW_UUIDS = (process.env.UUID || process.env.UUIDS || DEFAULT_UUID).trim();
 
-export const VERSION = '2.4.1';
-let outboundProxy = null;
+function parseUuid(raw) {
+  const clean = raw.replace(/-/g, '').toLowerCase().trim();
+  if (!/^[0-9a-f]{32}$/.test(clean)) return null;
+  const formatted = `${clean.slice(0, 8)}-${clean.slice(8, 12)}-${clean.slice(12, 16)}-${clean.slice(16, 20)}-${clean.slice(20, 32)}`;
+  return { clean, formatted };
+}
 
-// Helpers for V2Ray / VLESS protocol compatibility
-function tokenToUUID(token) {
-  if (!token) return '';
-  const clean = token.replace(/-/g, '');
-  if (/^[0-9a-fA-F]{32}$/.test(clean.slice(0, 32))) {
-    const h = clean.slice(0, 32).toLowerCase();
-    return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;
+const VALID_UUIDS = new Set();
+const FORMATTED_UUIDS = [];
+
+for (const entry of RAW_UUIDS.split(',')) {
+  const p = parseUuid(entry);
+  if (p) {
+    VALID_UUIDS.add(p.clean);
+    FORMATTED_UUIDS.push(p.formatted);
   }
-  const h = crypto.createHash('md5').update(token).digest('hex');
-  return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20,32)}`;
 }
 
-function formatUUID(buf) {
-  return [
-    buf.subarray(0, 4).toString('hex'),
-    buf.subarray(4, 6).toString('hex'),
-    buf.subarray(6, 8).toString('hex'),
-    buf.subarray(8, 10).toString('hex'),
-    buf.subarray(10, 16).toString('hex')
-  ].join('-');
+if (VALID_UUIDS.size === 0) {
+  const def = parseUuid(DEFAULT_UUID);
+  VALID_UUIDS.add(def.clean);
+  FORMATTED_UUIDS.push(def.formatted);
 }
 
-// Automatically load configuration from .env or config.json if present
-if (fs.existsSync('.env')) {
-  try {
-    const lines = fs.readFileSync('.env', 'utf8').split('\n');
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const idx = trimmed.indexOf('=');
-      if (idx !== -1) {
-        const key = trimmed.slice(0, idx).trim();
-        let val = trimmed.slice(idx + 1).trim();
-        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-          val = val.slice(1, -1);
-        }
-        process.env[key] = val;
+const PRIMARY_UUID = FORMATTED_UUIDS[0];
+const PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '3000', 10);
+const HOST = process.env.HOST || '0.0.0.0';
+const WSS_PATH = (process.env.WSS_PATH || process.env.VLESS_PATH || '/').trim();
+const NODE_NAME = process.env.NODE_NAME || process.env.NODE_ALIAS || 'VLESS-Node';
+
+// TLS auto-detection
+const CERT_FILE = process.env.CERT_FILE || path.resolve('cert.pem');
+const KEY_FILE = process.env.KEY_FILE || path.resolve('key.pem');
+const HAS_TLS = fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE);
+
+// Metrics
+let activeConnections = 0;
+let totalConnections = 0;
+let bytesReceived = 0;
+let bytesSent = 0;
+const startedAt = Date.now();
+
+// -------------------------------------------------------------
+// 2. VLESS Protocol Parser (RFC Spec Compliant)
+// -------------------------------------------------------------
+function parseVlessHeader(buffer) {
+  if (buffer.length < 24) {
+    return { error: 'Header too short' };
+  }
+
+  const version = buffer[0];
+  if (version !== 0) {
+    return { error: `Unsupported VLESS version (${version})` };
+  }
+
+  // 16 bytes binary UUID
+  const clientUuidHex = buffer.subarray(1, 17).toString('hex').toLowerCase();
+  if (!VALID_UUIDS.has(clientUuidHex)) {
+    return { error: 'Unauthorized UUID' };
+  }
+
+  // Addons section
+  const addonsLen = buffer[17];
+  let cursor = 18 + addonsLen;
+  if (buffer.length < cursor + 4) {
+    return { error: 'Malformed command section' };
+  }
+
+  const command = buffer[cursor]; // 1 = TCP, 2 = UDP, 3 = Mux
+  const targetPort = buffer.readUInt16BE(cursor + 1);
+  const addressType = buffer[cursor + 3];
+  cursor += 4;
+
+  let targetHost = '';
+  if (addressType === 1) { // IPv4 (4 bytes)
+    if (buffer.length < cursor + 4) return { error: 'Malformed IPv4 address' };
+    targetHost = `${buffer[cursor]}.${buffer[cursor + 1]}.${buffer[cursor + 2]}.${buffer[cursor + 3]}`;
+    cursor += 4;
+  } else if (addressType === 2) { // Domain name (1-byte len + ASCII string)
+    const domainLen = buffer[cursor];
+    cursor += 1;
+    if (buffer.length < cursor + domainLen) return { error: 'Malformed domain name' };
+    targetHost = buffer.subarray(cursor, cursor + domainLen).toString('utf8');
+    cursor += domainLen;
+  } else if (addressType === 3) { // IPv6 (16 bytes)
+    if (buffer.length < cursor + 16) return { error: 'Malformed IPv6 address' };
+    const parts = [];
+    for (let i = 0; i < 16; i += 2) {
+      parts.push(buffer.readUInt16BE(cursor + i).toString(16));
+    }
+    targetHost = parts.join(':');
+    cursor += 16;
+  } else {
+    return { error: `Unsupported address type: ${addressType}` };
+  }
+
+  const initialPayload = buffer.subarray(cursor);
+
+  return {
+    command,
+    targetPort,
+    targetHost,
+    initialPayload
+  };
+}
+
+// -------------------------------------------------------------
+// 3. TCP Streaming Engine
+// -------------------------------------------------------------
+function handleTcp(ws, targetHost, targetPort, initialPayload) {
+  let isClosed = false;
+  let targetSocket = null;
+  activeConnections++;
+  totalConnections++;
+
+  const cleanup = () => {
+    if (isClosed) return;
+    isClosed = true;
+    activeConnections = Math.max(0, activeConnections - 1);
+    if (targetSocket && !targetSocket.destroyed) targetSocket.destroy();
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      ws.close();
+    }
+  };
+
+  ws.on('close', cleanup);
+  ws.on('error', cleanup);
+
+  targetSocket = net.connect({ host: targetHost, port: targetPort }, () => {
+    if (isClosed) return;
+
+    // Send VLESS response header (version 0, addons length 0)
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(Buffer.from([0x00, 0x00]));
+    }
+
+    // Write initial payload (e.g. TLS Client Hello or HTTP GET)
+    if (initialPayload && initialPayload.length > 0) {
+      targetSocket.write(initialPayload);
+      bytesSent += initialPayload.length;
+    }
+
+    // 1. WebSocket -> Target TCP (Upload) with backpressure
+    ws.on('message', (chunk) => {
+      if (!Buffer.isBuffer(chunk)) chunk = Buffer.from(chunk);
+      bytesSent += chunk.length;
+      const canWrite = targetSocket.write(chunk);
+      if (!canWrite && ws._socket && ws._socket.pause) {
+        ws._socket.pause();
       }
+    });
+
+    targetSocket.on('drain', () => {
+      if (ws._socket && ws._socket.resume) {
+        ws._socket.resume();
+      }
+    });
+
+    // 2. Target TCP -> WebSocket (Download) with backpressure
+    targetSocket.on('data', (chunk) => {
+      bytesReceived += chunk.length;
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(chunk);
+        if (ws.bufferedAmount > 64 * 1024) {
+          targetSocket.pause();
+        }
+      }
+    });
+  });
+
+  const drainCheck = setInterval(() => {
+    if (isClosed) {
+      clearInterval(drainCheck);
+      return;
     }
-    console.log('[CONFIG] Successfully loaded environment from .env');
-  } catch (err) {
-    console.warn('[CONFIG] Error reading .env:', err.message);
-  }
-} else if (fs.existsSync('config.json')) {
-  try {
-    const cfg = JSON.parse(fs.readFileSync('config.json', 'utf8'));
-    for (const [key, val] of Object.entries(cfg)) {
-      process.env[key] = val;
+    if (targetSocket && targetSocket.isPaused && targetSocket.isPaused() && ws.bufferedAmount < 16 * 1024) {
+      targetSocket.resume();
     }
-    console.log('[CONFIG] Successfully loaded configuration from config.json');
-  } catch (err) {
-    console.warn('[CONFIG] Error reading config.json:', err.message);
-  }
+  }, 25);
+
+  targetSocket.on('error', cleanup);
+  targetSocket.on('close', cleanup);
 }
 
-// Configuration
-const PORT = parseInt(process.env.SERVER_PORT || process.env.PORT || process.argv[2] || '8080', 10);
-const HOST = '0.0.0.0';
-const CONTROL_PLANE = process.env.CONTROL_PLANE || 'https://cnct.accopture.top';
-const NODE_SECRET = process.env.NODE_SECRET || null;
-const NODE_ALIAS = process.env.NODE_ALIAS || 'ws-ro';
-const REGISTER_FILE = path.resolve('.registered');
-
-// TLS & Cloud Environment Auto-Detection
-const CERT_FILE = process.env.SSL_CERT || path.resolve('cert.pem');
-const KEY_FILE = process.env.SSL_KEY || path.resolve('key.pem');
-const HAS_LOCAL_TLS = fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE);
-
-// Render PaaS detection
-const IS_RENDER = process.env.RENDER === 'true' || Boolean(process.env.RENDER_SERVICE_ID) || Boolean(process.env.RENDER_EXTERNAL_HOSTNAME);
-const PUBLIC_HOST = process.env.RENDER_EXTERNAL_HOSTNAME || process.env.PUBLIC_HOST || null;
-const EXTERNAL_PORT = parseInt(process.env.EXTERNAL_PORT || (IS_RENDER ? '443' : PORT), 10);
-const EXTERNAL_TLS = process.env.FORCE_TLS === 'true' || (IS_RENDER ? true : HAS_LOCAL_TLS);
-
-// In-memory valid client tokens & active connections
-let validTokens = new Set();
-const activeSessions = new Set(); // { ws, targetSocket, token }
-
 // -------------------------------------------------------------
-// 1. First-Boot / Reconfiguration Self-Registration
+// 4. UDP Streaming Engine (DNS & UDP Apps)
 // -------------------------------------------------------------
-async function registerNode() {
-  if (!NODE_SECRET) {
-    console.log('[REG] NODE_SECRET not set, skipping registration.');
+function handleUdp(ws, targetHost, targetPort, initialPayload) {
+  let isClosed = false;
+  let udpSocket = null;
+  activeConnections++;
+  totalConnections++;
+
+  const cleanup = () => {
+    if (isClosed) return;
+    isClosed = true;
+    activeConnections = Math.max(0, activeConnections - 1);
+    if (udpSocket) {
+      try { udpSocket.close(); } catch {}
+    }
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      ws.close();
+    }
+  };
+
+  ws.on('close', cleanup);
+  ws.on('error', cleanup);
+
+  try {
+    udpSocket = dgram.createSocket('udp4');
+  } catch {
+    cleanup();
     return;
   }
 
-  // Check if already registered with matching config
-  if (fs.existsSync(REGISTER_FILE)) {
-    try {
-      const existing = JSON.parse(fs.readFileSync(REGISTER_FILE, 'utf8'));
-      if (
-        existing.tls === EXTERNAL_TLS &&
-        existing.alias === NODE_ALIAS &&
-        existing.port === EXTERNAL_PORT &&
-        existing.host === (PUBLIC_HOST || `${NODE_ALIAS}.cnct.accopture.top`)
-      ) {
-        console.log('[REG] Node already registered with matching config. Skipping.');
-        return;
-      }
-    } catch {}
+  // Send VLESS response header (version 0, addons length 0)
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(Buffer.from([0x00, 0x00]));
   }
 
-  console.log(`[REG] Registering node '${NODE_ALIAS}' (External TLS: ${EXTERNAL_TLS}, Port: ${EXTERNAL_PORT}) with control plane: ${CONTROL_PLANE}...`);
-  try {
-    const isPrivateIP = (ip) => {
-      if (!ip) return true;
-      return /^(10\.|127\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.)/.test(ip.trim());
-    };
+  udpSocket.on('message', (msg) => {
+    bytesReceived += msg.length;
+    if (ws.readyState === WebSocket.OPEN) {
+      const lenBuf = Buffer.alloc(2);
+      lenBuf.writeUInt16BE(msg.length, 0);
+      ws.send(Buffer.concat([lenBuf, msg]));
+    }
+  });
 
-    // Detect public IP (env PUBLIC_IP first if non-private)
-    let publicIp = (process.env.PUBLIC_IP && !isPrivateIP(process.env.PUBLIC_IP)) ? process.env.PUBLIC_IP.trim() : null;
+  udpSocket.on('error', cleanup);
 
-    // If PUBLIC_HOST is available (e.g. Render external hostname), resolve its public IP
-    if (!publicIp && PUBLIC_HOST) {
-      try {
-        const lookupRes = await dns.promises.lookup(PUBLIC_HOST);
-        if (lookupRes && lookupRes.address && !isPrivateIP(lookupRes.address)) {
-          publicIp = lookupRes.address;
+  const forwardUdp = (chunk) => {
+    let offset = 0;
+    while (offset + 2 < chunk.length) {
+      const pLen = chunk.readUInt16BE(offset);
+      offset += 2;
+      if (offset + pLen <= chunk.length) {
+        const packet = chunk.subarray(offset, offset + pLen);
+        offset += pLen;
+        bytesSent += packet.length;
+
+        // For DNS (port 53), support DoH fallback in case container host blocks UDP 53
+        if (targetPort === 53) {
+          udpSocket.send(packet, targetPort, targetHost, (err) => {
+            if (err) {
+              resolveDnsDoH(packet).then((resp) => {
+                if (resp && ws.readyState === WebSocket.OPEN) {
+                  const lenBuf = Buffer.alloc(2);
+                  lenBuf.writeUInt16BE(resp.length, 0);
+                  ws.send(Buffer.concat([lenBuf, resp]));
+                }
+              }).catch(() => {});
+            }
+          });
+        } else {
+          udpSocket.send(packet, targetPort, targetHost, () => {});
         }
-      } catch {}
+      } else {
+        break;
+      }
     }
+  };
 
-    if (!publicIp) {
-      try {
-        const res = await fetch('https://icanhazip.com', { signal: AbortSignal.timeout(5000) });
-        const detected = (await res.text()).trim();
-        if (!isPrivateIP(detected)) publicIp = detected;
-      } catch {}
-    }
+  if (initialPayload && initialPayload.length > 2) {
+    forwardUdp(initialPayload);
+  }
 
-    if (!publicIp) {
-      try {
-        const res = await fetch('https://api.ipify.org', { signal: AbortSignal.timeout(5000) });
-        const detected = (await res.text()).trim();
-        if (!isPrivateIP(detected)) publicIp = detected;
-      } catch {}
-    }
+  ws.on('message', (chunk) => {
+    if (!Buffer.isBuffer(chunk)) chunk = Buffer.from(chunk);
+    forwardUdp(chunk);
+  });
+}
 
-    if (!publicIp) {
-      console.error('[REG] Could not detect public IP. Skipping registration.');
-      return;
-    }
-
-    console.log(`[REG] Detected public IP: ${publicIp}, External Port: ${EXTERNAL_PORT}, Host: ${PUBLIC_HOST || `${NODE_ALIAS}.cnct.accopture.top`}`);
-
-    const regRes = await fetch(`${CONTROL_PLANE}/api/register`, {
+// Fallback DoH resolver for hosters that block outbound port 53
+async function resolveDnsDoH(dnsQuery) {
+  try {
+    let res = await fetch('https://1.1.1.1/dns-query', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${NODE_SECRET}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        alias: NODE_ALIAS,
-        ip: publicIp,
-        port: EXTERNAL_PORT,
-        tls: EXTERNAL_TLS,
-        host: PUBLIC_HOST,
-        version: VERSION
-      }),
-      signal: AbortSignal.timeout(10000)
+      headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
+      body: dnsQuery,
+      signal: AbortSignal.timeout(2500)
     });
-
-    let regData;
-    const contentType = regRes.headers.get('content-type') || '';
-    if (contentType.includes('application/json')) {
-      regData = await regRes.json();
-    } else {
-      const text = await regRes.text();
-      regData = { error: `Server returned HTTP ${regRes.status} (non-JSON): ${text.slice(0, 80).replace(/\s+/g, ' ')}...` };
+    if (!res.ok) {
+      res = await fetch('https://dns.google/dns-query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
+        body: dnsQuery,
+        signal: AbortSignal.timeout(2500)
+      });
     }
-
-    if (regRes.ok && regData && regData.domain) {
-      fs.writeFileSync(REGISTER_FILE, JSON.stringify({
-        ...regData,
-        version: VERSION,
-        tls: EXTERNAL_TLS,
-        alias: NODE_ALIAS,
-        port: EXTERNAL_PORT,
-        host: PUBLIC_HOST || regData.domain
-      }, null, 2));
-      console.log(`[REG] Success! Node registered as: ${regData.domain} (${publicIp}:${EXTERNAL_PORT}, TLS: ${EXTERNAL_TLS})`);
-      if (regData.dns) console.log(`[REG] Cloudflare DNS status: ${regData.dns}`);
-    } else {
-      console.error(`[REG] Registration failed (${regRes.status}):`, regData.error || regData);
-    }
-  } catch (err) {
-    console.error(`[REG] Registration error: ${err.message}`);
-  }
-}
-
-// -------------------------------------------------------------
-// 2. 60-Second Token Sync Loop & Auto-Registration Retry
-// -------------------------------------------------------------
-async function syncTokens() {
-  if (!NODE_SECRET) return;
-
-  try {
-    const res = await fetch(`${CONTROL_PLANE}/api/tokens`, {
-      headers: { 'Authorization': `Bearer ${NODE_SECRET}` },
-      signal: AbortSignal.timeout(7000)
-    });
-
     if (res.ok) {
-      const data = await res.json();
-      if (Array.isArray(data.tokens)) {
-        validTokens = new Set(data.tokens);
-
-        // Check active sessions: drop any whose token is no longer valid
-        for (const session of activeSessions) {
-          if (!validTokens.has(session.token)) {
-            console.warn(`[AUTH] Dropping connection: Token '${session.token}' was revoked.`);
-            session.ws.close(4001, 'Token revoked');
-            if (session.targetSocket) session.targetSocket.destroy();
-            activeSessions.delete(session);
-          }
-        }
-      }
+      return Buffer.from(await res.arrayBuffer());
     }
-  } catch {
-    // If control plane is briefly unreachable, keep existing cache
+  } catch {}
+  return null;
+}
+
+// -------------------------------------------------------------
+// 5. HTTP Dashboard & Subscription Generator
+// -------------------------------------------------------------
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function formatUptime(seconds) {
+  const d = Math.floor(seconds / (3600 * 24));
+  const h = Math.floor((seconds % (3600 * 24)) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  const parts = [];
+  if (d > 0) parts.push(`${d}d`);
+  if (h > 0) parts.push(`${h}h`);
+  if (m > 0) parts.push(`${m}m`);
+  parts.push(`${s}s`);
+  return parts.join(' ');
+}
+
+function buildVlessUrl(reqHost, isTls) {
+  let host = reqHost;
+  let port = PORT;
+
+  if (reqHost.includes(':')) {
+    const parts = reqHost.split(':');
+    host = parts[0];
+    port = parseInt(parts[1], 10);
+  } else {
+    port = isTls ? 443 : 80;
   }
+
+  const security = isTls ? 'tls' : 'none';
+  const cleanPath = encodeURIComponent(WSS_PATH.startsWith('/') ? WSS_PATH : `/${WSS_PATH}`);
+  return `vless://${PRIMARY_UUID}@${host}:${port}?encryption=none&security=${security}&type=ws&path=${cleanPath}#${encodeURIComponent(NODE_NAME)}`;
 }
 
-// Recurring timer: token sync every 60s, registration retry every 30s until successful
-if (NODE_SECRET) {
-  setInterval(syncTokens, 60000);
-  setInterval(async () => {
-    if (!fs.existsSync(REGISTER_FILE)) {
-      await registerNode();
+function handleHttpRequest(req, res) {
+  const reqUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const pathname = reqUrl.pathname;
+  const reqHost = req.headers.host || `localhost:${PORT}`;
+  const isTls = HAS_TLS || req.headers['x-forwarded-proto'] === 'https';
+  const vlessUrl = buildVlessUrl(reqHost, isTls);
+
+  // Health / Ping endpoint
+  if (pathname === '/health' || pathname === '/ping' || pathname === '/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      status: 'online',
+      node: NODE_NAME,
+      uptime: Math.floor((Date.now() - startedAt) / 1000),
+      activeConnections,
+      totalConnections,
+      tls: isTls,
+      port: PORT
+    }));
+  }
+
+  // Raw subscription endpoint
+  if (pathname === '/sub' || pathname === '/subscription') {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end(Buffer.from(vlessUrl).toString('base64'));
+  }
+
+  // Raw link endpoint
+  if (pathname === '/link') {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end(vlessUrl);
+  }
+
+  // Web Dashboard
+  const uptimeStr = formatUptime((Date.now() - startedAt) / 1000);
+  const rxStr = formatBytes(bytesReceived);
+  const txStr = formatBytes(bytesSent);
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${NODE_NAME} — VLESS Node</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --primary: #38bdf8;
+      --primary-hover: #0ea5e9;
+      --green: #22c55e;
     }
-  }, 30000);
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      min-height: 100vh;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+    .container {
+      width: 100%;
+      max-width: 680px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 2rem;
+      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.4);
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1.5rem;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .header h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(34, 197, 94, 0.15);
+      color: var(--green);
+      font-size: 0.85rem;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 9999px;
+      border: 1px solid rgba(34, 197, 94, 0.3);
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      background: var(--green);
+      border-radius: 50%;
+      box-shadow: 0 0 8px var(--green);
+    }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    .stat-card {
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.85rem;
+      text-align: center;
+    }
+    .stat-label {
+      font-size: 0.75rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 4px;
+    }
+    .stat-val {
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: var(--primary);
+    }
+    .section-title {
+      font-size: 0.95rem;
+      font-weight: 600;
+      margin-bottom: 0.5rem;
+      color: var(--text);
+    }
+    .link-box {
+      background: rgba(15, 23, 42, 0.8);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.85rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.8rem;
+      color: #bae6fd;
+      word-break: break-all;
+      margin-bottom: 1rem;
+      user-select: all;
+    }
+    .btn-group {
+      display: flex;
+      gap: 0.75rem;
+      margin-bottom: 1.5rem;
+    }
+    button, a.btn {
+      flex: 1;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      background: var(--primary);
+      color: #0f172a;
+      font-weight: 600;
+      font-size: 0.9rem;
+      padding: 10px 16px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      text-decoration: none;
+      transition: background 0.15s ease;
+    }
+    button:hover, a.btn:hover {
+      background: var(--primary-hover);
+    }
+    a.btn-secondary {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    a.btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.05);
+    }
+    .instructions {
+      background: rgba(15, 23, 42, 0.4);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem;
+      font-size: 0.85rem;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .instructions ol {
+      margin-left: 1.2rem;
+      margin-top: 0.5rem;
+    }
+    .instructions strong {
+      color: var(--text);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div>
+        <h1>${NODE_NAME}</h1>
+        <div style="font-size: 0.8rem; color: var(--muted); margin-top: 2px;">VLESS over WebSocket Node</div>
+      </div>
+      <div class="badge"><span class="dot"></span> Online</div>
+    </div>
+
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Uptime</div>
+        <div class="stat-val">${uptimeStr}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Active</div>
+        <div class="stat-val">${activeConnections}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Total Sockets</div>
+        <div class="stat-val">${totalConnections}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Traffic</div>
+        <div class="stat-val">${txStr} ↑ / ${rxStr} ↓</div>
+      </div>
+    </div>
+
+    <div class="section-title">VLESS Connection Link</div>
+    <div class="link-box" id="vlessLink">${vlessUrl}</div>
+
+    <div class="btn-group">
+      <button id="copyBtn" onclick="copyLink()">📋 Copy VLESS Link</button>
+      <a class="btn btn-secondary" href="/sub" target="_blank">📥 Subscription Link</a>
+    </div>
+
+    <div class="instructions">
+      <strong>How to Connect:</strong>
+      <ol>
+        <li>Click <strong>Copy VLESS Link</strong> above.</li>
+        <li>Open your client: <strong>v2rayNG</strong> (Android), <strong>V2Box / Streisand</strong> (iOS), <strong>Sing-box / Nekoray</strong> (PC).</li>
+        <li>Select <strong>"+" → Import config from clipboard</strong>.</li>
+        <li>Connect and enjoy uncensored internet!</li>
+      </ol>
+    </div>
+  </div>
+
+  <script>
+    function copyLink() {
+      const text = document.getElementById('vlessLink').innerText;
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.getElementById('copyBtn');
+        const orig = btn.innerText;
+        btn.innerText = '✅ Copied!';
+        setTimeout(() => { btn.innerText = orig; }, 2000);
+      });
+    }
+  </script>
+</body>
+</html>`;
+
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(html);
 }
 
 // -------------------------------------------------------------
-// 3. Server Setup (HTTPS/WSS if certs exist, otherwise HTTP/WS)
+// 6. Server Initialization
 // -------------------------------------------------------------
-const requestHandler = (req, res) => {
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
-    status: 'online',
-    version: VERSION,
-    alias: NODE_ALIAS,
-    tls: EXTERNAL_TLS,
-    localTls: HAS_LOCAL_TLS,
-    platform: IS_RENDER ? 'render' : 'standalone',
-    warp: Boolean(outboundProxy?.enabled),
-    host: PUBLIC_HOST,
-    port: EXTERNAL_PORT,
-    activeSessions: activeSessions.size,
-    tokensLoaded: validTokens.size,
-    uptime: Math.floor(process.uptime())
-  }));
-};
-
 let server;
-if (HAS_LOCAL_TLS && !IS_RENDER && process.env.FORCE_HTTP !== 'true') {
+
+if (HAS_TLS && process.env.FORCE_HTTP !== 'true') {
   console.log('[TLS] Loading SSL certificate from cert.pem and key.pem...');
   server = https.createServer({
     cert: fs.readFileSync(CERT_FILE),
     key: fs.readFileSync(KEY_FILE),
     minVersion: 'TLSv1.2'
-  }, requestHandler);
+  }, handleHttpRequest);
   console.log('[TLS] HTTPS and WSS (Encrypted) enabled!');
 } else {
-  server = http.createServer(requestHandler);
-  if (IS_RENDER) {
-    console.log('[RENDER] Render environment detected. Listening on plain HTTP/WS internally; TLS terminated by Render edge on port 443.');
-  } else {
-    console.log('[TLS] cert.pem/key.pem not found. Running in plain HTTP/WS mode.');
-  }
+  server = http.createServer(handleHttpRequest);
+  console.log('[HTTP] Running in standard HTTP / WS mode.');
 }
 
 server.on('error', (err) => {
   console.error('[SERVER] Fatal server error:', err.message);
 });
 
+// WebSocket Server attached to HTTP(S) server
 const wss = new WebSocketServer({ server });
 
-// -------------------------------------------------------------
-// Native DNS Client Handler (RFC 1035 TCP-framed DNS via DoH)
-// -------------------------------------------------------------
-function handleDnsClient(ws, req, clientToken) {
-  // Validate token if sync is active
-  if (NODE_SECRET && validTokens.size > 0) {
-    if (!clientToken || !validTokens.has(clientToken)) {
-      console.warn(`[AUTH] Rejected DNS client from ${req.socket.remoteAddress}: Invalid token.`);
-      ws.close(4001, 'Unauthorized');
-      return;
-    }
-  }
-
-  const session = { ws, targetSocket: null, token: clientToken };
-  activeSessions.add(session);
-
-  let inBuffer = Buffer.alloc(0);
-
-  const cleanup = () => {
-    activeSessions.delete(session);
-    if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) ws.close();
-  };
-
-  ws.on('close', cleanup);
-  ws.on('error', cleanup);
-
-  ws.on('message', (chunk) => {
-    inBuffer = Buffer.concat([inBuffer, chunk]);
-    while (inBuffer.length >= 2) {
-      const qLen = inBuffer.readUInt16BE(0);
-      if (inBuffer.length >= 2 + qLen) {
-        const dnsQuery = inBuffer.subarray(2, 2 + qLen);
-        inBuffer = inBuffer.subarray(2 + qLen);
-
-        (async () => {
-          try {
-            let res = null;
-            try {
-              res = await fetch('https://1.1.1.1/dns-query', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/dns-message',
-                  'Accept': 'application/dns-message'
-                },
-                body: dnsQuery,
-                signal: AbortSignal.timeout(2500)
-              });
-            } catch {}
-
-            if (!res || !res.ok) {
-              try {
-                res = await fetch('https://dns.google/dns-query', {
-                  method: 'POST',
-                  headers: {
-                    'Content-Type': 'application/dns-message',
-                    'Accept': 'application/dns-message'
-                  },
-                  body: dnsQuery,
-                  signal: AbortSignal.timeout(2500)
-                });
-              } catch {}
-            }
-
-            if (res && res.ok && ws.readyState === ws.OPEN) {
-              const respBuf = Buffer.from(await res.arrayBuffer());
-              const framed = Buffer.concat([
-                Buffer.from([respBuf.length >> 8, respBuf.length & 0xFF]),
-                respBuf
-              ]);
-              ws.send(framed);
-            }
-          } catch (e) {
-            console.warn(`[DNS] DoH resolution failed: ${e.message}`);
-          }
-        })();
-      } else {
-        break;
-      }
-    }
-  });
-}
-
-// -------------------------------------------------------------
-// Native CLI Client Connection Handler (vpn connect <alias>)
-// -------------------------------------------------------------
-function handleCliClient(ws, req, clientToken, host, port) {
-  // Validate token if sync is active
-  if (NODE_SECRET && validTokens.size > 0) {
-    if (!clientToken || !validTokens.has(clientToken)) {
-      console.warn(`[AUTH] Rejected client from ${req.socket.remoteAddress}: Invalid token.`);
-      ws.close(4001, 'Unauthorized');
-      return;
-    }
-  }
-
-  // Reject private / poisoned IPs (e.g. 10.10.34.x Iranian censorship landers)
-  if (!host || host.startsWith('10.10.34.') || host.startsWith('127.') || host === 'localhost') {
-    ws.close(1008, 'Blocked destination');
-    return;
-  }
-
-  const session = { ws, targetSocket: null, token: clientToken };
-  activeSessions.add(session);
-
-  let isCleanedUp = false;
-  let drainInterval = null;
-  let targetSocket = null;
-  const earlyChunks = [];
-
-  const onEarlyMessage = (chunk) => {
-    earlyChunks.push(chunk);
-  };
-  ws.on('message', onEarlyMessage);
-
-  const cleanup = () => {
-    if (isCleanedUp) return;
-    isCleanedUp = true;
-    ws.off('message', onEarlyMessage);
-    earlyChunks.length = 0;
-    if (drainInterval) clearInterval(drainInterval);
-    activeSessions.delete(session);
-    if (targetSocket && !targetSocket.destroyed) targetSocket.destroy();
-    if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) ws.close();
-  };
-
-  ws.on('close', cleanup);
-  ws.on('error', cleanup);
-
-  // Connect to target destination (Direct or via Cloudflare WARP / Outbound SOCKS5)
-  dialTarget({ targetHost: host, targetPort: port, outboundProxy })
-    .then((sock) => {
-      if (isCleanedUp) {
-        sock.destroy();
-        return;
-      }
-      targetSocket = sock;
-      session.targetSocket = targetSocket;
-      targetSocket.on('close', cleanup);
-      targetSocket.on('error', cleanup);
-
-      ws.off('message', onEarlyMessage);
-
-      // Flush all buffered early chunks (e.g. TLS Client Hello)
-      for (const chunk of earlyChunks) {
-        targetSocket.write(chunk);
-      }
-      earlyChunks.length = 0;
-
-      // 1. WS -> TCP with Backpressure
-      ws.on('message', (chunk) => {
-        const canWrite = targetSocket.write(chunk);
-        if (!canWrite && ws._socket) ws._socket.pause();
-      });
-
-      targetSocket.on('drain', () => {
-        if (ws._socket) ws._socket.resume();
-      });
-
-      // 2. TCP -> WS with Backpressure
-      targetSocket.on('data', (chunk) => {
-        if (ws.readyState === ws.OPEN) {
-          ws.send(chunk);
-          if (ws.bufferedAmount > 64 * 1024) {
-            targetSocket.pause();
-          }
-        }
-      });
-
-      drainInterval = setInterval(() => {
-        if (ws.bufferedAmount < 16 * 1024 && targetSocket.isPaused()) {
-          targetSocket.resume();
-        }
-      }, 20);
-    })
-    .catch((err) => {
-      console.warn(`[DIAL] Failed to reach ${host}:${port}: ${err.message}`);
-      cleanup();
-    });
-}
-
-// -------------------------------------------------------------
-// VLESS Mobile Protocol Handler (v2rayNG, V2Box, Streisand, Shadowrocket, Sing-box)
-// -------------------------------------------------------------
-function handleVlessClient(ws, req) {
-  let isCleanedUp = false;
-  let targetSocket = null;
-  let udpSocket = null;
-  let drainInterval = null;
-  const session = { ws, targetSocket: null, token: 'vless-client' };
-  activeSessions.add(session);
-
-  const cleanup = () => {
-    if (isCleanedUp) return;
-    isCleanedUp = true;
-    if (drainInterval) clearInterval(drainInterval);
-    activeSessions.delete(session);
-    if (targetSocket && !targetSocket.destroyed) targetSocket.destroy();
-    if (udpSocket) {
-      try { udpSocket.close(); } catch {}
-    }
-    if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) ws.close();
-  };
-
-  ws.on('close', cleanup);
-  ws.on('error', cleanup);
-
-  // Wait for initial binary VLESS request frame
-  ws.once('message', async (buffer) => {
-    try {
-      if (!Buffer.isBuffer(buffer)) buffer = Buffer.from(buffer);
-      if (buffer.length < 24) {
-        ws.close(1002, 'VLESS header too short');
-        return;
-      }
-
-      const version = buffer[0];
-      if (version !== 0) {
-        ws.close(1002, 'Unsupported VLESS version');
-        return;
-      }
-
-      const clientUuid = formatUUID(buffer.subarray(1, 17));
-
-      // Authenticate UUID against synced tokens
-      if (NODE_SECRET && validTokens.size > 0) {
-        let matched = false;
-        for (const tok of validTokens) {
-          if (tokenToUUID(tok) === clientUuid || tok === clientUuid) {
-            matched = true;
-            break;
-          }
-        }
-        if (!matched) {
-          console.warn(`[VLESS] Rejected unauthorized UUID ${clientUuid} from ${req.socket.remoteAddress}`);
-          ws.close(4001, 'Unauthorized UUID');
-          return;
-        }
-      }
-
-      const addonsLen = buffer[17];
-      let cursor = 18 + addonsLen;
-      if (buffer.length < cursor + 4) {
-        ws.close(1002, 'Invalid VLESS command section');
-        return;
-      }
-
-      const command = buffer[cursor]; // 1 = TCP, 2 = UDP
-      const targetPort = buffer.readUInt16BE(cursor + 1);
-      const addressType = buffer[cursor + 3];
-      cursor += 4;
-
-      let targetHost = '';
-      if (addressType === 1) { // IPv4
-        if (buffer.length < cursor + 4) return ws.close(1002, 'Invalid IPv4 address');
-        targetHost = `${buffer[cursor]}.${buffer[cursor+1]}.${buffer[cursor+2]}.${buffer[cursor+3]}`;
-        cursor += 4;
-      } else if (addressType === 2) { // Domain
-        const dLen = buffer[cursor];
-        cursor += 1;
-        if (buffer.length < cursor + dLen) return ws.close(1002, 'Invalid domain name');
-        targetHost = buffer.subarray(cursor, cursor + dLen).toString('utf8');
-        cursor += dLen;
-      } else if (addressType === 3) { // IPv6
-        if (buffer.length < cursor + 16) return ws.close(1002, 'Invalid IPv6 address');
-        const parts = [];
-        for (let i = 0; i < 16; i += 2) parts.push(buffer.readUInt16BE(cursor + i).toString(16));
-        targetHost = parts.join(':');
-        cursor += 16;
-      } else {
-        ws.close(1002, 'Unknown address type');
-        return;
-      }
-
-      const initialPayload = buffer.subarray(cursor);
-
-      // Send VLESS response header (version 0, addons length 0)
-      ws.send(Buffer.from([0x00, 0x00]));
-
-      // 1. TCP Tunneling
-      if (command === 1) {
-        const earlyChunks = [];
-        const onEarlyMessage = (chunk) => earlyChunks.push(chunk);
-        ws.on('message', onEarlyMessage);
-
-        const sock = await dialTarget({ targetHost, targetPort, outboundProxy });
-        if (isCleanedUp) {
-          sock.destroy();
-          return;
-        }
-        targetSocket = sock;
-        session.targetSocket = targetSocket;
-        targetSocket.on('close', cleanup);
-        targetSocket.on('error', cleanup);
-
-        if (initialPayload.length > 0) {
-          targetSocket.write(initialPayload);
-        }
-
-        ws.off('message', onEarlyMessage);
-        for (const chunk of earlyChunks) {
-          targetSocket.write(chunk);
-        }
-        earlyChunks.length = 0;
-
-        ws.on('message', (chunk) => {
-          const canWrite = targetSocket.write(chunk);
-          if (!canWrite && ws._socket) ws._socket.pause();
-        });
-
-        targetSocket.on('drain', () => {
-          if (ws._socket) ws._socket.resume();
-        });
-
-        targetSocket.on('data', (chunk) => {
-          if (ws.readyState === ws.OPEN) {
-            ws.send(chunk);
-            if (ws.bufferedAmount > 64 * 1024) targetSocket.pause();
-          }
-        });
-
-        drainInterval = setInterval(() => {
-          if (ws.bufferedAmount < 16 * 1024 && targetSocket.isPaused()) {
-            targetSocket.resume();
-          }
-        }, 20);
-
-      // 2. UDP Tunneling (DNS / VoIP / Gaming)
-      } else if (command === 2) {
-        udpSocket = dgram.createSocket('udp4');
-        udpSocket.on('error', cleanup);
-        udpSocket.on('message', (msg) => {
-          if (ws.readyState === ws.OPEN) {
-            const lenBuf = Buffer.alloc(2);
-            lenBuf.writeUInt16BE(msg.length, 0);
-            ws.send(Buffer.concat([lenBuf, msg]));
-          }
-        });
-
-        const forwardUdp = (chunk) => {
-          let off = 0;
-          while (off + 2 < chunk.length) {
-            const pLen = chunk.readUInt16BE(off);
-            off += 2;
-            if (off + pLen <= chunk.length) {
-              const pkt = chunk.subarray(off, off + pLen);
-              udpSocket.send(pkt, targetPort, targetHost);
-              off += pLen;
-            } else {
-              break;
-            }
-          }
-        };
-
-        if (initialPayload.length > 2) {
-          forwardUdp(initialPayload);
-        }
-
-        ws.on('message', forwardUdp);
-
-      } else {
-        ws.close(1003, 'Unsupported VLESS command');
-      }
-
-    } catch (err) {
-      console.warn(`[VLESS] Error handling client: ${err.message}`);
-      cleanup();
-    }
-  });
-}
-
 wss.on('connection', (ws, req) => {
-  const reqUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const clientToken = reqUrl.searchParams.get('token') || req.headers['x-auth-token'];
-  const host = reqUrl.searchParams.get('host');
-  const port = parseInt(reqUrl.searchParams.get('port'), 10);
+  // Wait for initial binary VLESS request frame
+  ws.once('message', (initialChunk) => {
+    if (!Buffer.isBuffer(initialChunk)) initialChunk = Buffer.from(initialChunk);
 
-  // If host and port are given in search parameters, handle as native CLI client
-  if (host && port) {
-    if (port === 53 || host === 'dns') {
-      handleDnsClient(ws, req, clientToken);
+    const parsed = parseVlessHeader(initialChunk);
+    if (parsed.error) {
+      console.warn(`[VLESS] Handshake rejected from ${req.socket.remoteAddress}: ${parsed.error}`);
+      ws.close(4001, parsed.error);
       return;
     }
-    handleCliClient(ws, req, clientToken, host, port);
-    return;
-  }
 
-  // Otherwise, handle as standard VLESS client (v2rayNG, V2Box, Streisand, etc.)
-  handleVlessClient(ws, req);
+    const { command, targetHost, targetPort, initialPayload } = parsed;
+
+    // 1. TCP Tunneling
+    if (command === 1) {
+      handleTcp(ws, targetHost, targetPort, initialPayload);
+    // 2. UDP Tunneling (DNS / VoIP / Gaming)
+    } else if (command === 2) {
+      handleUdp(ws, targetHost, targetPort, initialPayload);
+    } else {
+      console.warn(`[VLESS] Unsupported command ${command} from ${req.socket.remoteAddress}`);
+      ws.close(1002, 'Unsupported command');
+    }
+  });
+
+  ws.on('error', () => {});
 });
 
-server.listen(PORT, HOST, async () => {
-  // Initialize Userspace WARP / Outbound Proxy if enabled
-  outboundProxy = await initWarp({ controlPlane: CONTROL_PLANE, nodeSecret: NODE_SECRET });
-
-  console.log(`===============================================`);
-  console.log(` WS-VPN Relay Node [${NODE_ALIAS}] v${VERSION} listening on ${HOST}:${PORT}`);
-  console.log(` External: ${PUBLIC_HOST || HOST}:${EXTERNAL_PORT} (TLS: ${EXTERNAL_TLS})`);
-  console.log(` Platform: ${IS_RENDER ? 'Render Cloud (PaaS)' : 'Standalone VPS'}`);
-  console.log(` Outbound: ${outboundProxy?.enabled ? `Proxied via ${outboundProxy.host}:${outboundProxy.port} (Clean Consumer IP)` : 'Direct VPS Egress'}`);
-  console.log(` Control Plane: ${CONTROL_PLANE}`);
-  console.log(`===============================================`);
-  if (NODE_SECRET) {
-    await syncTokens();
-  }
-  await registerNode();
-
-  // Keep-alive heartbeat for Render free-tier (prevents idle spin-down)
-  if (IS_RENDER || process.env.KEEP_ALIVE === 'true') {
-    const keepAliveUrl = process.env.RENDER_EXTERNAL_URL || (PUBLIC_HOST ? `https://${PUBLIC_HOST}` : null);
-    if (keepAliveUrl) {
-      console.log(`[RENDER] Keep-alive active: pinging ${keepAliveUrl} every 10 minutes.`);
-      setInterval(() => {
-        fetch(`${keepAliveUrl}/`).catch(() => {});
-      }, 10 * 60 * 1000);
-    }
-  }
+// Start listening
+server.listen(PORT, HOST, () => {
+  console.log('==================================================');
+  console.log(` VLESS WebSocket Server [${NODE_NAME}]`);
+  console.log(` Listening on : ${HOST}:${PORT} (${HAS_TLS ? 'WSS/TLS' : 'WS/Plain'})`);
+  console.log(` UUID         : ${PRIMARY_UUID}`);
+  console.log(` Path         : ${WSS_PATH}`);
+  console.log('==================================================');
 });
